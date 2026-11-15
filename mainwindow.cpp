@@ -3,7 +3,9 @@
 
 #include "QDir"
 #include "QFormLayout"
-#include "QGraphicsRectItem"
+#include "QGraphicsItem"
+#include "QComboBox"
+#include "QPolygonF"
 #include "QGraphicsScene"
 #include "QGraphicsView"
 #include "QMessageBox"
@@ -18,14 +20,17 @@
 #include "QVBoxLayout"
 #include <QtCore/qnamespace.h>
 #include <QtCore/qobject.h>
+#include <QtCore/qpoint.h>
 #include <QtCore/qstandardpaths.h>
 #include <QtCore/qtypes.h>
+#include <QtGui/qpolygon.h>
 #include <QtSql/qsqldatabase.h>
 #include <QtSql/qsqlquery.h>
 #include <QtSql/qsqltablemodel.h>
 #include <QtWidgets/qabstractitemview.h>
 #include <QtWidgets/qboxlayout.h>
 #include <QtWidgets/qformlayout.h>
+#include <QtWidgets/qgraphicsitem.h>
 #include <QtWidgets/qmessagebox.h>
 #include <QtWidgets/qpushbutton.h>
 #include <QtWidgets/qspinbox.h>
@@ -51,10 +56,15 @@ MainWindow::MainWindow(QWidget *parent)
     heightInput->setRange(1, 1000);
     heightInput->setValue(80);
 
-    auto *button = new QPushButton(tr("Добавить прямоугольник"));
+    auto *typeInput = new QComboBox;
+    typeInput->addItem(tr("Прямоугольник"), QStringLiteral("rectangle"));
+    typeInput->addItem(tr("Эллипс"), QStringLiteral("ellipse"));
+    typeInput->addItem(tr("Шестиугольник"), QStringLiteral("hexagon"));
+    auto *button = new QPushButton(tr("Добавить фигуру"));
     button->setEnabled(false);
 
     auto *form = new QFormLayout;
+    form->addRow(tr("Тип фигуры"), typeInput);
     form->addRow(tr("Ширина"), widthInput);
     form->addRow(tr("Высота"), heightInput);
     form->addRow(button);
@@ -96,13 +106,25 @@ MainWindow::MainWindow(QWidget *parent)
         return;
     }
 
-    const auto drawRectangle = [scene](qreal x, qreal y, int width, int height) {
-        auto *rectangle = scene->addRect(x, y, width, height);
-        rectangle->setBrush(Qt::blue);
-        return rectangle;
+    const auto drawShape = [scene](const QString &type, qreal x, qreal y, qreal width, qreal height) {
+        QAbstractGraphicsShapeItem *item;
+
+        if (type == "ellipse") {
+            item = scene->addEllipse(0, 0, width, height);
+        } else if (type == "hexagon") {
+            QPolygonF points;
+            points << QPointF(width / 4, 0) << QPointF(3 * width / 4, 0) << QPointF(width, height / 2) << QPointF(3 * width / 4, height) << QPointF(width / 4, height) << QPointF(0, height / 2);
+            item = scene->addPolygon(points);
+        } else {
+            item = scene->addRect(0, 0, width, height);
+        }
+
+        item->setPos(x, y);
+        item->setBrush(Qt::blue);
+        return item;
     };
 
-    if (!query.exec("SELECT x, y, width, height FROM shapes ORDER BY id")) {
+    if (!query.exec("SELECT x, y, width, height, type FROM shapes ORDER BY id")) {
         showDatabaseError(query.lastError().text());
         return;
     }
@@ -113,7 +135,8 @@ MainWindow::MainWindow(QWidget *parent)
         const int y = query.value(1).toInt();
         const int width = query.value(2).toInt();
         const int height = query.value(3).toInt();
-        drawRectangle(x, y, width, height);
+        const QString type = query.value(4).toString();
+        drawShape(type, x, y, width, height);
         nextX = x + width + 20;
     }
     query.finish();
@@ -133,15 +156,18 @@ MainWindow::MainWindow(QWidget *parent)
     table->hideColumn(5);
 
     connect(button, &QPushButton::clicked, this, [=]() mutable {
+        const QString type = typeInput->currentData().toString();
         const int width = widthInput->value();
         const int height = heightInput->value();
         const int y = 20;
 
         QSqlQuery insert(database);
-        if (!insert.prepare("INSERT INTO shapes (type, width, height, x, y) VALUES ('rectangle', ?, ?, ?, ?)")){
+        if (!insert.prepare(
+                "INSERT INTO shapes (type, width, height, x, y) VALUES (?, ?, ?, ?, ?)")) {
             showDatabaseError(insert.lastError().text());
             return;
         }
+        insert.addBindValue(type);
         insert.addBindValue(width);
         insert.addBindValue(height);
         insert.addBindValue(nextX);
@@ -151,9 +177,9 @@ MainWindow::MainWindow(QWidget *parent)
             return;
         }
 
-        auto *rectangle = drawRectangle(nextX, y, width, height);
+        auto *item = drawShape(type, nextX, y, width, height);
         nextX += width + 20;
-        view->ensureVisible(rectangle);
+        view->ensureVisible(item);
         if (!model->select()) {
             showDatabaseError(model->lastError().text());
         }
