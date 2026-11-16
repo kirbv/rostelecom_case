@@ -2,6 +2,7 @@
 #include "ui_mainwindow.h"
 #include "shapescene.h"
 
+#include "QItemSelectionModel"
 #include "QHash"
 #include "QPalette"
 #include "QPen"
@@ -23,6 +24,8 @@
 #include "QStandardPaths"
 #include "QTableView"
 #include "QVBoxLayout"
+#include <QtCore/qabstractitemmodel.h>
+#include <QtCore/qitemselectionmodel.h>
 #include <QtCore/qline.h>
 #include <QtCore/qnamespace.h>
 #include <QtCore/qobject.h>
@@ -159,7 +162,6 @@ MainWindow::MainWindow(QWidget *parent)
         return;
     }
 
-    QHash<qint64, QGraphicsItem *> itemsById;
     while (query.next()) {
         const qreal x = query.value(0).toDouble();
         const qreal y = query.value(1).toDouble();
@@ -168,8 +170,7 @@ MainWindow::MainWindow(QWidget *parent)
         const QString type = query.value(4).toString();
         const qint64 id = query.value(5).toLongLong();
         auto *item = drawShape(type, x, y, width, height);
-        item->setData(0, id);
-        itemsById.insert(id, item);
+        scene->registerShape(id, item);
     }
     query.finish();
 
@@ -182,8 +183,8 @@ MainWindow::MainWindow(QWidget *parent)
         return;
     }
     while (query.next()) {
-        auto *first = itemsById.value(query.value(0).toLongLong());
-        auto *second = itemsById.value(query.value(1).toLongLong());
+        auto *first = scene->shapeById(query.value(0).toLongLong());
+        auto *second = scene->shapeById(query.value(1).toLongLong());
         if (first && second) {
             drawConnection(first, second);
         }
@@ -203,6 +204,43 @@ MainWindow::MainWindow(QWidget *parent)
     table->setModel(model);
     table->hideColumn(4);
     table->hideColumn(5);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+
+    auto *deleteButton = new QPushButton(tr("Удалить выбранную фигуру"));
+    deleteButton->setEnabled(false);
+    form->addRow(deleteButton);
+
+    auto *selection = table->selectionModel();
+    connect(selection, &QItemSelectionModel::selectionChanged, deleteButton, [selection, deleteButton] {
+        deleteButton->setEnabled(!selection->selectedRows().isEmpty());
+    });
+    connect(model, &QAbstractItemModel::modelReset, deleteButton, [deleteButton] {
+        deleteButton->setEnabled(false);
+    });
+
+    connect(deleteButton, &QPushButton::clicked, this, [=] {
+        const auto rows = selection->selectedRows(0);
+        if (rows.isEmpty()) return;
+        const qint64 id = rows.first().data().toLongLong();
+
+        QSqlQuery remove(database);
+        if (!remove.prepare("DELETE FROM shapes WHERE id = ?")) {
+            showDatabaseError(remove.lastError().text());
+            return;
+        }
+
+        remove.addBindValue(id);
+        if (!remove.exec()) {
+            showDatabaseError(remove.lastError().text());
+            return;
+        }
+
+        scene->removeShape(id);
+        if (!model->select()) {
+            showDatabaseError(model->lastError().text());
+        }
+    });
 
     connect(scene, &ShapeScene::dragFinished, this, [database, scene, showDatabaseError](const QHash<QGraphicsItem *, QPointF> &originalPositions) mutable {
         const auto restorePositions = [&](const QString &message) {
@@ -270,7 +308,7 @@ MainWindow::MainWindow(QWidget *parent)
         }
 
         auto *item = drawShape(type, x, y, width, height);
-        item->setData(0, insert.lastInsertId().toLongLong());
+        scene->registerShape(insert.lastInsertId().toLongLong(), item);
         view->ensureVisible(item);
         if (!model->select()) {
             showDatabaseError(model->lastError().text());

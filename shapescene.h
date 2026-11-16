@@ -22,6 +22,31 @@ class ShapeScene : public QGraphicsScene {
 public:
     using QGraphicsScene::QGraphicsScene;
 
+    void registerShape(qint64 id, QGraphicsItem *item) {
+        item->setData(0, id);
+        shapesById.insert(id, item);
+    }
+
+    QGraphicsItem *shapeById(qint64 id) const {
+        return shapesById.value(id);
+    }
+
+    void removeShape(qint64 id) {
+        auto *shape = shapesById.take(id);
+        if (!shape) return;
+
+        positionsBeforeDrag.remove(shape);
+        for (auto it = connections.begin(); it != connections.end();) {
+            if (it->first == shape || it->second == shape) {
+                delete it->line;
+                it = connections.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        delete shape;
+    }
+
     void addConnection(QGraphicsItem *first, QGraphicsItem *second, const QPen &pen) {
         auto *line = addLine(QLineF(), pen);
         line->setZValue(-1);
@@ -89,5 +114,6 @@ private:
     };
 
     QList<Connection> connections;
+    QHash<qint64, QGraphicsItem *> shapesById;
     QHash<QGraphicsItem *, QPointF> positionsBeforeDrag;
 };
