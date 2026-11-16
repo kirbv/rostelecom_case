@@ -2,6 +2,9 @@
 #include "ui_mainwindow.h"
 #include "shapescene.h"
 
+#include "QHBoxLayout"
+#include "QLineEdit"
+#include "QStringList"
 #include "QItemSelectionModel"
 #include "QHash"
 #include "QPalette"
@@ -42,10 +45,63 @@
 #include <QtWidgets/qformlayout.h>
 #include <QtWidgets/qgraphicsitem.h>
 #include <QtWidgets/qgraphicsscene.h>
+#include <QtWidgets/qlineedit.h>
 #include <QtWidgets/qmessagebox.h>
 #include <QtWidgets/qpushbutton.h>
 #include <QtWidgets/qspinbox.h>
 #include <QtWidgets/qtableview.h>
+
+namespace {
+
+QString setupShapeCounts(QSqlDatabase database) {
+    if (!database.transaction()) {
+        return database.lastError().text();
+    }
+
+    const QStringList statements = {
+        R"(CREATE TABLE IF NOT EXISTS shape_type_counts (
+            type TEXT PRIMARY KEY NOT NULL,
+            total INTEGER NOT NULL CHECK (total >= 0)
+        ))",
+        R"(INSERT INTO shape_type_counts (type, total)
+            SELECT type, COUNT(*) FROM shapes GROUP BY type
+            ON CONFLICT(type) DO UPDATE SET total = excluded.total)",
+        R"(CREATE TRIGGER IF NOT EXISTS shape_count_after_insert
+           AFTER INSERT ON shapes
+           BEGIN
+               INSERT INTO shape_type_counts (type, total) VALUES (NEW.type, 1)
+               ON CONFLICT(type) DO UPDATE SET total = total + 1;
+           END)",
+        R"(CREATE TRIGGER IF NOT EXISTS shape_count_after_delete
+           AFTER DELETE ON shapes
+           BEGIN
+               UPDATE shape_type_counts SET total = total - 1 WHERE type = OLD.type;
+           END)",
+        R"(CREATE VIEW IF NOT EXISTS shapes_with_counts AS
+           SELECT s.id, s.type, s.width, s.height, s.x, s.y, c.total AS type_count
+           FROM shapes AS s
+           JOIN shape_type_counts AS c ON c.type = s.type)"
+    };
+
+    QSqlQuery query(database);
+    for (const QString &statement : statements) {
+        if (!query.exec(statement)) {
+            const QString error = query.lastError().text();
+            database.rollback();
+            return error;
+        }
+    }
+
+    if (!database.commit()) {
+        const QString error = database.lastError().text();
+        database.rollback();
+        return error;
+    }
+
+    return {};
+}
+
+}
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -137,6 +193,12 @@ MainWindow::MainWindow(QWidget *parent)
         return;
     }
 
+    const QString countError = setupShapeCounts(database);
+    if (!countError.isEmpty()) {
+        showDatabaseError(countError);
+        return;
+    }
+
     const auto drawShape = [scene](const QString &type, qreal x, qreal y, qreal width, qreal height) {
         QAbstractGraphicsShapeItem *item;
 
@@ -192,7 +254,8 @@ MainWindow::MainWindow(QWidget *parent)
     query.finish();
 
     auto *model = new QSqlTableModel(table, database);
-    model->setTable("shapes");
+    model->setTable("shapes_with_counts");
+    model->setSort(0, Qt::AscendingOrder);
     if (!model->select()) {
         showDatabaseError(model->lastError().text());
         return;
@@ -201,9 +264,78 @@ MainWindow::MainWindow(QWidget *parent)
     model->setHeaderData(1, Qt::Horizontal, tr("Тип"));
     model->setHeaderData(2, Qt::Horizontal, tr("Ширина"));
     model->setHeaderData(3, Qt::Horizontal, tr("Высота"));
+    model->setHeaderData(6, Qt::Horizontal, tr("Всего этого типа"));
+
     table->setModel(model);
     table->hideColumn(4);
     table->hideColumn(5);
+
+    auto *idFilter = new QLineEdit;
+    idFilter->setPlaceholderText(tr("ID фигуры"));
+
+    auto *typeFilter = new QComboBox;
+    typeFilter->addItem(tr("Все типы"));
+    for (int i = 0; i < typeInput->count(); ++i) {
+        typeFilter->addItem(typeInput->itemText(i), typeInput->itemData(i));
+    }
+
+    auto *countFilter = new QLineEdit;
+    countFilter->setPlaceholderText(tr("Количество по типу"));
+
+    auto *applyFilterButton = new QPushButton(tr("Применить"));
+    auto *clearFilterButton = new QPushButton(tr("Сбросить"));
+    auto *filterRow = new QHBoxLayout;
+    filterRow->addWidget(idFilter);
+    filterRow->addWidget(typeFilter);
+    filterRow->addWidget(countFilter);
+    filterRow->addWidget(applyFilterButton);
+    filterRow->addWidget(clearFilterButton);
+    layout->insertLayout(layout->count() - 1, filterRow);
+
+    const auto applyFilter = [=] {
+        QStringList conditions;
+
+        const auto addNumberCondition = [&conditions](QLineEdit *field, const QString &column) {
+            const QString text = field->text().trimmed();
+            if (text.isEmpty()) {
+                return true;
+            }
+
+            bool ok = false;
+            const qint64 value = text.toLongLong(&ok);
+            if (!ok || value < 1) {
+                field->setFocus();
+                return false;
+            }
+
+            conditions.append(column + "=" + QString::number(value));
+            return true;
+        };
+
+        if (!addNumberCondition(idFilter, "id") || !addNumberCondition(countFilter, "type_count")) {
+            QMessageBox::warning(this, tr("Фильтр"), tr("Введите целое положительное число."));
+            return;
+        }
+
+        const QString type = typeFilter->currentData().toString();
+        if (!type.isEmpty()) {
+            conditions.append(QStringLiteral("type = '%1'").arg(type));
+        }
+
+        model->setFilter(conditions.join(" AND "));
+        if (model->lastError().isValid()) {
+            showDatabaseError(model->lastError().text());
+        }
+    };
+
+    connect(applyFilterButton, &QPushButton::clicked, this, applyFilter);
+    connect(clearFilterButton, &QPushButton::clicked, this, [=] {
+        idFilter->clear();
+        typeFilter->setCurrentIndex(0);
+        countFilter->clear();
+        applyFilter();
+    });
+
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
     table->setSelectionMode(QAbstractItemView::SingleSelection);
 
