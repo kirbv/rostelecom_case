@@ -1,6 +1,10 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
+#include "QHash"
+#include "QPalette"
+#include "QPen"
+#include "algorithm"
 #include "QDir"
 #include "QFormLayout"
 #include "QGraphicsItem"
@@ -18,11 +22,13 @@
 #include "QStandardPaths"
 #include "QTableView"
 #include "QVBoxLayout"
+#include <QtCore/qline.h>
 #include <QtCore/qnamespace.h>
 #include <QtCore/qobject.h>
 #include <QtCore/qpoint.h>
 #include <QtCore/qstandardpaths.h>
 #include <QtCore/qtypes.h>
+#include <QtGui/qpalette.h>
 #include <QtGui/qpolygon.h>
 #include <QtSql/qsqldatabase.h>
 #include <QtSql/qsqlquery.h>
@@ -31,6 +37,7 @@
 #include <QtWidgets/qboxlayout.h>
 #include <QtWidgets/qformlayout.h>
 #include <QtWidgets/qgraphicsitem.h>
+#include <QtWidgets/qgraphicsscene.h>
 #include <QtWidgets/qmessagebox.h>
 #include <QtWidgets/qpushbutton.h>
 #include <QtWidgets/qspinbox.h>
@@ -69,6 +76,14 @@ MainWindow::MainWindow(QWidget *parent)
     form->addRow(tr("Высота"), heightInput);
     form->addRow(button);
 
+    auto *linkButton = new QPushButton(tr("Связать две фигуры"));
+    linkButton->setEnabled(false);
+    form->addRow(linkButton);
+
+    connect(scene, &QGraphicsScene::selectionChanged, linkButton, [scene, linkButton] {
+        linkButton->setEnabled(scene->selectedItems().size() == 2);
+    });
+
     auto *layout = new QVBoxLayout(centralWidget());
     layout->addLayout(form);
     layout->addWidget(view, 2);
@@ -106,6 +121,18 @@ MainWindow::MainWindow(QWidget *parent)
         return;
     }
 
+    if (!query.exec("PRAGMA foreign_keys = ON") || !query.exec(R"(
+        CREATE TABLE IF NOT EXISTS connections (
+            first_id INTEGER NOT NULL REFERENCES shapes(id) ON DELETE CASCADE,
+            second_id INTEGER NOT NULL REFERENCES shapes(id) ON DELETE CASCADE,
+            PRIMARY KEY (first_id, second_id),
+            CHECK (first_id < second_id)
+        )
+    )")) {
+        showDatabaseError(query.lastError().text());
+        return;
+    }
+
     const auto drawShape = [scene](const QString &type, qreal x, qreal y, qreal width, qreal height) {
         QAbstractGraphicsShapeItem *item;
 
@@ -119,16 +146,18 @@ MainWindow::MainWindow(QWidget *parent)
             item = scene->addRect(0, 0, width, height);
         }
 
+        item->setFlag(QGraphicsItem::ItemIsSelectable);
         item->setPos(x, y);
         item->setBrush(Qt::blue);
         return item;
     };
 
-    if (!query.exec("SELECT x, y, width, height, type FROM shapes ORDER BY id")) {
+    if (!query.exec("SELECT x, y, width, height, type, id FROM shapes ORDER BY id")) {
         showDatabaseError(query.lastError().text());
         return;
     }
 
+    QHash<qint64, QGraphicsItem *> itemsById;
     qint64 nextX = 20;
     while (query.next()) {
         const qint64 x = query.value(0).toLongLong();
@@ -136,8 +165,30 @@ MainWindow::MainWindow(QWidget *parent)
         const int width = query.value(2).toInt();
         const int height = query.value(3).toInt();
         const QString type = query.value(4).toString();
-        drawShape(type, x, y, width, height);
+        const qint64 id = query.value(5).toLongLong();
+        auto *item = drawShape(type, x, y, width, height);
+        item->setData(0, id);
+        itemsById.insert(id, item);
         nextX = x + width + 20;
+    }
+    query.finish();
+
+    const auto drawConnection = [scene, view](QGraphicsItem *first, QGraphicsItem *second) {
+        const QLineF line(first->sceneBoundingRect().center(), second->sceneBoundingRect().center());
+        auto *item = scene->addLine(line, QPen(view->palette().color(QPalette::Text), 2));
+        item->setZValue(-1);
+    };
+
+    if (!query.exec("SELECT first_id, second_id FROM connections")) {
+        showDatabaseError(query.lastError().text());
+        return;
+    }
+    while (query.next()) {
+        auto *first = itemsById.value(query.value(0).toLongLong());
+        auto *second = itemsById.value(query.value(1).toLongLong());
+        if (first && second) {
+            drawConnection(first, second);
+        }
     }
     query.finish();
 
@@ -178,12 +229,42 @@ MainWindow::MainWindow(QWidget *parent)
         }
 
         auto *item = drawShape(type, nextX, y, width, height);
+        item->setData(0, insert.lastInsertId().toLongLong());
         nextX += width + 20;
         view->ensureVisible(item);
         if (!model->select()) {
             showDatabaseError(model->lastError().text());
         }
     });
+
+    connect(linkButton, &QPushButton::clicked, this, [=] {
+        const auto selected = scene->selectedItems();
+        if (selected.size() != 2) {
+            return;
+        }
+
+        const qint64 firstId = selected[0]->data(0).toLongLong();
+        const qint64 secondId = selected[1]->data(0).toLongLong();
+
+        QSqlQuery insert(database);
+        if (!insert.prepare(
+            "INSERT INTO connections (first_id, second_id) VALUES (?, ?) "
+            "ON CONFLICT(first_id, second_id) DO NOTHING"
+        )) {
+            showDatabaseError(insert.lastError().text());
+            return;
+        }
+        insert.addBindValue(std::min(firstId, secondId));
+        insert.addBindValue(std::max(firstId, secondId));
+        if (!insert.exec()) {
+            showDatabaseError(insert.lastError().text());
+            return;
+        }
+        if (insert.numRowsAffected() == 1) {
+            drawConnection(selected[0], selected[1]);
+        }
+    });
+
     button->setEnabled(true);
 }
 
