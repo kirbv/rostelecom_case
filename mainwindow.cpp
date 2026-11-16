@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
+#include "shapescene.h"
 
 #include "QHash"
 #include "QPalette"
@@ -50,7 +51,7 @@ MainWindow::MainWindow(QWidget *parent)
     ui->setupUi(this);
     setWindowTitle(tr("Редактор фигур"));
 
-    auto *scene = new QGraphicsScene(this);
+    auto *scene = new ShapeScene(this);
     auto *view = new QGraphicsView(scene);
     auto *table = new QTableView;
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -147,6 +148,7 @@ MainWindow::MainWindow(QWidget *parent)
         }
 
         item->setFlag(QGraphicsItem::ItemIsSelectable);
+        item->setFlag(QGraphicsItem::ItemIsMovable);
         item->setPos(x, y);
         item->setBrush(Qt::blue);
         return item;
@@ -158,10 +160,9 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     QHash<qint64, QGraphicsItem *> itemsById;
-    qint64 nextX = 20;
     while (query.next()) {
-        const qint64 x = query.value(0).toLongLong();
-        const int y = query.value(1).toInt();
+        const qreal x = query.value(0).toDouble();
+        const qreal y = query.value(1).toDouble();
         const int width = query.value(2).toInt();
         const int height = query.value(3).toInt();
         const QString type = query.value(4).toString();
@@ -169,14 +170,11 @@ MainWindow::MainWindow(QWidget *parent)
         auto *item = drawShape(type, x, y, width, height);
         item->setData(0, id);
         itemsById.insert(id, item);
-        nextX = x + width + 20;
     }
     query.finish();
 
     const auto drawConnection = [scene, view](QGraphicsItem *first, QGraphicsItem *second) {
-        const QLineF line(first->sceneBoundingRect().center(), second->sceneBoundingRect().center());
-        auto *item = scene->addLine(line, QPen(view->palette().color(QPalette::Text), 2));
-        item->setZValue(-1);
+        scene->addConnection(first, second, QPen(view->palette().color(QPalette::Text), 2));
     };
 
     if (!query.exec("SELECT first_id, second_id FROM connections")) {
@@ -206,10 +204,53 @@ MainWindow::MainWindow(QWidget *parent)
     table->hideColumn(4);
     table->hideColumn(5);
 
+    connect(scene, &ShapeScene::dragFinished, this, [database, scene, showDatabaseError](const QHash<QGraphicsItem *, QPointF> &originalPositions) mutable {
+        const auto restorePositions = [&](const QString &message) {
+            for (auto it = originalPositions.cbegin(); it != originalPositions.cend(); ++it) {
+                it.key()->setPos(it.value());
+            }
+            scene->updateConnections();
+            showDatabaseError(message);
+        };
+
+        if (!database.transaction()) {
+            restorePositions(database.lastError().text());
+            return;
+        }
+
+        QSqlQuery update(database);
+        if (!update.prepare("UPDATE shapes SET x = ?, y = ? WHERE id = ?")) {
+            database.rollback();
+            restorePositions(update.lastError().text());
+            return;
+        }
+
+        for (auto it = originalPositions.cbegin(); it != originalPositions.cend(); ++it) {
+            auto *item = it.key();
+            update.bindValue(0, item->pos().x());
+            update.bindValue(1, item->pos().y());
+            update.bindValue(2, item->data(0).toLongLong());
+
+            if (!update.exec()) {
+                const QString error = update.lastError().text();
+                database.rollback();
+                restorePositions(error);
+                return;
+            }
+        }
+
+        if (!database.commit()) {
+            const QString error = database.lastError().text();
+            database.rollback();
+            restorePositions(error);
+        }
+    });
+
     connect(button, &QPushButton::clicked, this, [=]() mutable {
         const QString type = typeInput->currentData().toString();
         const int width = widthInput->value();
         const int height = heightInput->value();
+        const qreal x = qMax(qreal(20), scene->itemsBoundingRect().right() + 20);
         const int y = 20;
 
         QSqlQuery insert(database);
@@ -221,16 +262,15 @@ MainWindow::MainWindow(QWidget *parent)
         insert.addBindValue(type);
         insert.addBindValue(width);
         insert.addBindValue(height);
-        insert.addBindValue(nextX);
+        insert.addBindValue(x);
         insert.addBindValue(y);
         if (!insert.exec()) {
             showDatabaseError(insert.lastError().text());
             return;
         }
 
-        auto *item = drawShape(type, nextX, y, width, height);
+        auto *item = drawShape(type, x, y, width, height);
         item->setData(0, insert.lastInsertId().toLongLong());
-        nextX += width + 20;
         view->ensureVisible(item);
         if (!model->select()) {
             showDatabaseError(model->lastError().text());

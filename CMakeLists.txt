@@ -13,6 +13,7 @@ qt_add_executable(r_case
     main.cpp
     mainwindow.cpp
     mainwindow.h
+    shapescene.h
     mainwindow.ui
 )
 
