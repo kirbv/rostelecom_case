@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include "shapescene.h"
+#include "shapecountdelegate.h"
 
 #include "QHBoxLayout"
 #include "QLineEdit"
@@ -267,6 +268,7 @@ MainWindow::MainWindow(QWidget *parent)
     model->setHeaderData(6, Qt::Horizontal, tr("Всего этого типа"));
 
     table->setModel(model);
+    table->setItemDelegateForColumn(6, new ShapeCountDelegate(table));
     table->hideColumn(4);
     table->hideColumn(5);
 
